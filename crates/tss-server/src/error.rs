@@ -171,10 +171,15 @@ impl From<TsProtoError> for AppError {
     fn from(e: TsProtoError) -> Self {
         match e {
             TsProtoError::QueryError { id, msg, extra_msg } => {
-                let detail = match extra_msg {
+                let mut detail = match extra_msg {
                     Some(ex) if !ex.is_empty() => format!("{msg}: {ex} (error id={id})"),
                     _ => format!("{msg} (error id={id})"),
                 };
+                if id == 524 || id == 3329 {
+                    detail.push_str(
+                        " — TeamSpeak ServerQuery flood protection triggered; wait for cooldown or add TSS Manager's IP to query_ip_allowlist.txt",
+                    );
+                }
                 AppError::UpstreamTs {
                     ts_error_id: Some(id),
                     detail,

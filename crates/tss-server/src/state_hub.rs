@@ -6,11 +6,12 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, Qu
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch, RwLock};
 use tracing::warn;
 use tss_tsproto::{
     create_driver, ChannelNode, OnlineClient, ProtocolKind, ServerInfoSnapshot, TsConnectionConfig,
-    TsNotifyEvent, TsProtocolDriver,
+    TsNotifyEvent, TsProtoError, TsProtocolDriver,
 };
 use uuid::Uuid;
 
@@ -36,6 +37,7 @@ struct InstanceRuntime {
     default_sid: u32,
     status: String,
     last_error: Option<String>,
+    cooldown_until: Option<Instant>,
     live_servers: BTreeMap<u32, LiveVirtualServerState>,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -111,6 +113,7 @@ impl StateHub {
                     default_sid: cfg.virtual_server_id,
                     status: "connecting".to_string(),
                     last_error: None,
+                    cooldown_until: None,
                     live_servers: BTreeMap::new(),
                     shutdown_tx,
                 },
@@ -187,12 +190,17 @@ impl StateHub {
         record_metric: bool,
     ) -> ApiResult<LiveVirtualServerState> {
         let driver = self.driver_for(instance_id).await?;
-        let info_res = driver.get_server_info(sid).await;
-        let channels_res = driver.list_channels(sid).await;
-        let clients_res = driver.list_clients(sid).await;
+        let sync_res: Result<(ServerInfoSnapshot, Vec<ChannelNode>, Vec<OnlineClient>), TsProtoError> =
+            async {
+                let info = driver.get_server_info(sid).await?;
+                let channels = driver.list_channels(sid).await?;
+                let clients = driver.list_clients(sid).await?;
+                Ok((info, channels, clients))
+            }
+            .await;
 
-        match (info_res, channels_res, clients_res) {
-            (Ok(info), Ok(channels), Ok(clients)) => {
+        match sync_res {
+            Ok((info, channels, clients)) => {
                 let voice_count = clients.iter().filter(|c| c.client_type == 0).count() as i32;
                 let now_str = Utc::now().to_rfc3339();
                 let live = LiveVirtualServerState {
@@ -201,7 +209,8 @@ impl StateHub {
                     clients: clients.clone(),
                     updated_at: now_str.clone(),
                 };
-                self.set_instance_status(instance_id, "online", None).await;
+                self.set_instance_status(instance_id, "online", None, None)
+                    .await;
                 {
                     let mut guard = self.runtimes.write().await;
                     if let Some(rt) = guard.get_mut(instance_id) {
@@ -241,9 +250,14 @@ impl StateHub {
                 });
                 Ok(live)
             }
-            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-                let msg = e.to_string();
-                self.set_instance_status(instance_id, "offline", Some(msg.clone()))
+            Err(e) => {
+                let cooldown = parse_flood_cooldown(&e);
+                let app_err: AppError = e.into();
+                let msg = match &app_err {
+                    AppError::UpstreamTs { detail, .. } => detail.clone(),
+                    other => other.to_string(),
+                };
+                self.set_instance_status(instance_id, "offline", Some(msg.clone()), cooldown)
                     .await;
                 let _ = self.ws_tx.send(WsEnvelope {
                     event: "instance.status".to_string(),
@@ -255,16 +269,32 @@ impl StateHub {
                         "error": msg
                     }),
                 });
-                Err(e.into())
+                Err(app_err)
             }
         }
     }
 
-    async fn set_instance_status(&self, instance_id: &str, status: &str, err: Option<String>) {
+    async fn is_in_cooldown(&self, instance_id: &str) -> bool {
+        let guard = self.runtimes.read().await;
+        guard
+            .get(instance_id)
+            .and_then(|rt| rt.cooldown_until)
+            .map(|until| Instant::now() < until)
+            .unwrap_or(false)
+    }
+
+    async fn set_instance_status(
+        &self,
+        instance_id: &str,
+        status: &str,
+        err: Option<String>,
+        cooldown: Option<Duration>,
+    ) {
         let mut changed = false;
         {
             let mut guard = self.runtimes.write().await;
             if let Some(rt) = guard.get_mut(instance_id) {
+                rt.cooldown_until = cooldown.map(|d| Instant::now() + d);
                 if rt.status != status || rt.last_error != err {
                     rt.status = status.to_string();
                     rt.last_error = err.clone();
@@ -294,11 +324,9 @@ impl StateHub {
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
         let mut events = driver.subscribe_events();
-        let poll_secs = if driver.supports_push_events() { 15 } else { 3 };
-        let mut poll_tick = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
-        let mut metric_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        let poll_secs = if driver.supports_push_events() { 25 } else { 8 };
+        let mut poll_tick = tokio::time::interval(Duration::from_secs(poll_secs));
         poll_tick.tick().await;
-        metric_tick.tick().await;
 
         loop {
             tokio::select! {
@@ -310,22 +338,47 @@ impl StateHub {
                 evt = events.recv() => {
                     match evt {
                         Ok(TsNotifyEvent::TextMessage { .. }) => {}
-                        Ok(_) => {
-                            let _ = self.refresh_virtual_server(&instance_id, default_sid, false).await;
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            if self.is_in_cooldown(&instance_id).await {
+                                continue;
+                            }
+                            // Coalesce burst notify events before refreshing state
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            while events.try_recv().is_ok() {}
                             let _ = self.refresh_virtual_server(&instance_id, default_sid, false).await;
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
                 _ = poll_tick.tick() => {
-                    let _ = self.refresh_virtual_server(&instance_id, default_sid, false).await;
-                }
-                _ = metric_tick.tick() => {
+                    if self.is_in_cooldown(&instance_id).await {
+                        continue;
+                    }
                     let _ = self.refresh_virtual_server(&instance_id, default_sid, true).await;
                 }
             }
         }
+    }
+}
+
+fn parse_flood_cooldown(err: &TsProtoError) -> Option<Duration> {
+    match err {
+        TsProtoError::QueryError {
+            id: 3329,
+            extra_msg,
+            ..
+        } => {
+            let secs = extra_msg
+                .as_deref()
+                .and_then(|s| {
+                    s.split_whitespace()
+                        .find_map(|tok| tok.parse::<u64>().ok())
+                })
+                .unwrap_or(60)
+                .clamp(5, 600);
+            Some(Duration::from_secs(secs + 2))
+        }
+        TsProtoError::QueryError { id: 524, .. } => Some(Duration::from_secs(10)),
+        _ => None,
     }
 }

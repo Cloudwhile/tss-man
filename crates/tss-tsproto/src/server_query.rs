@@ -15,14 +15,15 @@ use crate::types::{
 };
 use async_trait::async_trait;
 use russh::client;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, watch, Mutex};
-use tokio::time::timeout;
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::time::{timeout, Instant};
 use tracing::{debug, warn};
 
 pub trait AsyncByteStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -148,7 +149,7 @@ impl AsyncWrite for SshChannelStream {
 impl QueryStreamConnector for SshConnector {
     async fn open_stream(&self) -> Result<Box<dyn AsyncByteStream>> {
         let config = Arc::new(client::Config {
-            inactivity_timeout: Some(Duration::from_secs(180)),
+            inactivity_timeout: Some(Duration::from_secs(300)),
             ..Default::default()
         });
         let addr = format!("{}:{}", self.host, self.port);
@@ -160,21 +161,26 @@ impl QueryStreamConnector for SshConnector {
         .map_err(|_| TsProtoError::Timeout)?
         .map_err(|e| TsProtoError::Ssh(e.to_string()))?;
 
-        let auth_ok = handle
-            .authenticate_password(&self.username, &self.secret)
-            .await
-            .map_err(|e| TsProtoError::Ssh(e.to_string()))?;
+        let auth_ok = timeout(
+            Duration::from_secs(10),
+            handle.authenticate_password(&self.username, &self.secret),
+        )
+        .await
+        .map_err(|_| TsProtoError::Timeout)?
+        .map_err(|e| TsProtoError::Ssh(e.to_string()))?;
         if !auth_ok {
-            return Err(TsProtoError::Ssh("SSH password authentication rejected".to_string()));
+            return Err(TsProtoError::Ssh(
+                "SSH password authentication rejected".to_string(),
+            ));
         }
 
-        let channel = handle
-            .channel_open_session()
+        let channel = timeout(Duration::from_secs(10), handle.channel_open_session())
             .await
+            .map_err(|_| TsProtoError::Timeout)?
             .map_err(|e| TsProtoError::Ssh(e.to_string()))?;
-        channel
-            .request_shell(true)
+        timeout(Duration::from_secs(10), channel.request_shell(true))
             .await
+            .map_err(|_| TsProtoError::Timeout)?
             .map_err(|e| TsProtoError::Ssh(e.to_string()))?;
 
         let stream = channel.into_stream();
@@ -193,32 +199,85 @@ impl QueryStreamConnector for SshConnector {
     }
 }
 
+const FLOOD_WINDOW: Duration = Duration::from_millis(3200);
+const MAX_CMDS_PER_WINDOW: usize = 8;
+
+/// Sliding-window command pacer so non-whitelisted IPs stay below TeamSpeak's
+/// default ServerQuery anti-flood threshold (10 commands per 3 seconds).
+struct FloodPacer {
+    sent_at: VecDeque<Instant>,
+}
+
+impl FloodPacer {
+    fn new() -> Self {
+        Self {
+            sent_at: VecDeque::with_capacity(MAX_CMDS_PER_WINDOW + 2),
+        }
+    }
+
+    async fn wait_slot(&mut self) {
+        loop {
+            let now = Instant::now();
+            while let Some(&front) = self.sent_at.front() {
+                if now.saturating_duration_since(front) >= FLOOD_WINDOW {
+                    self.sent_at.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if self.sent_at.len() < MAX_CMDS_PER_WINDOW {
+                self.sent_at.push_back(Instant::now());
+                return;
+            }
+            if let Some(&oldest) = self.sent_at.front() {
+                tokio::time::sleep_until(oldest + FLOOD_WINDOW).await;
+            } else {
+                return;
+            }
+        }
+    }
+}
+
 struct QueryConnection {
     reader: BufReader<tokio::io::ReadHalf<Box<dyn AsyncByteStream>>>,
     writer: tokio::io::WriteHalf<Box<dyn AsyncByteStream>>,
+    line_buf: Vec<u8>,
     active_sid: Option<u32>,
+    notify_registered: bool,
+    last_io: Instant,
 }
 
 impl QueryConnection {
-    async fn connect(connector: &dyn QueryStreamConnector) -> Result<Self> {
+    async fn connect(
+        connector: &dyn QueryStreamConnector,
+        pacer: &mut FloodPacer,
+        events_tx: &broadcast::Sender<TsNotifyEvent>,
+    ) -> Result<Self> {
         let stream = connector.open_stream().await?;
         let (rd, wr) = tokio::io::split(stream);
         let mut conn = Self {
             reader: BufReader::new(rd),
             writer: wr,
+            line_buf: Vec::with_capacity(512),
             active_sid: None,
+            notify_registered: false,
+            last_io: Instant::now(),
         };
         conn.read_greeting().await?;
 
         if connector.requires_login_command() {
             let (user, pass) = connector.credentials();
             if !user.trim().is_empty() {
-                conn.send_raw(&build_command(
-                    "login",
-                    &[],
-                    &[("client_login_name", user), ("client_login_password", pass)],
-                    &[],
-                ))
+                conn.send_raw(
+                    &build_command(
+                        "login",
+                        &[],
+                        &[("client_login_name", user), ("client_login_password", pass)],
+                        &[],
+                    ),
+                    pacer,
+                    events_tx,
+                )
                 .await?;
             }
         }
@@ -226,48 +285,98 @@ impl QueryConnection {
         Ok(conn)
     }
 
-    async fn read_line_trimmed(&mut self, wait: Duration) -> Result<String> {
-        let mut buf = Vec::with_capacity(256);
-        let n = timeout(wait, self.reader.read_until(b'\n', &mut buf))
-            .await
-            .map_err(|_| TsProtoError::Timeout)??;
-        if n == 0 {
-            return Err(TsProtoError::ConnectionClosed);
-        }
-        // Consume an immediate '\r' byte if TeamSpeak sent '\n\r'
-        let next_peek = self.reader.fill_buf().await;
-        if let Ok(slice) = next_peek {
-            if slice.first() == Some(&b'\r') {
-                self.reader.consume(1);
+    /// Cancel-safe line reader handling `\n\r` (TS3 Raw TCP), `\r\n` (SSH / TS6), and `\n`
+    /// without blocking on trailing bytes after `\n`.
+    async fn read_raw_line(&mut self) -> Result<String> {
+        loop {
+            let n = self.reader.read_until(b'\n', &mut self.line_buf).await?;
+            if n == 0 && self.line_buf.is_empty() {
+                return Err(TsProtoError::ConnectionClosed);
+            }
+            if self.line_buf.ends_with(b"\n") || n == 0 {
+                let bytes = std::mem::take(&mut self.line_buf);
+                self.last_io = Instant::now();
+                let s = String::from_utf8_lossy(&bytes);
+                return Ok(trim_ts_line(&s).to_string());
             }
         }
-        let s = String::from_utf8_lossy(&buf);
-        Ok(trim_ts_line(&s).to_string())
+    }
+
+    async fn read_line_with_timeout(&mut self, wait: Duration) -> Result<String> {
+        timeout(wait, self.read_raw_line())
+            .await
+            .map_err(|_| TsProtoError::Timeout)?
     }
 
     async fn read_greeting(&mut self) -> Result<()> {
-        let first = self.read_line_trimmed(Duration::from_secs(6)).await?;
-        if !first.contains("TS3") {
-            debug!("Unexpected TS greeting line 1: {first}");
+        let first = loop {
+            let line = self.read_line_with_timeout(Duration::from_secs(8)).await?;
+            if !line.trim().is_empty() {
+                break line;
+            }
+        };
+
+        if let Some(status) = parse_error_line(&first) {
+            if status.id != 0 {
+                return Err(TsProtoError::QueryError {
+                    id: status.id,
+                    msg: status.msg,
+                    extra_msg: status.extra_msg,
+                });
+            }
+        } else if !first.contains("TS3") && !first.starts_with("Welcome") {
+            debug!("Non-standard ServerQuery greeting line: {first}");
         }
-        // TeamSpeak sends a second Welcome line; try reading it briefly without failing if single-line
-        let _ = self.read_line_trimmed(Duration::from_millis(800)).await;
+
+        // Read optional second Welcome line without losing partial bytes if single-line
+        if let Ok(second_res) = timeout(Duration::from_millis(300), self.read_raw_line()).await {
+            if let Ok(second) = second_res {
+                if let Some(status) = parse_error_line(&second) {
+                    if status.id != 0 {
+                        return Err(TsProtoError::QueryError {
+                            id: status.id,
+                            msg: status.msg,
+                            extra_msg: status.extra_msg,
+                        });
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
-    async fn send_raw(&mut self, cmd_line: &str) -> Result<Vec<RecordMap>> {
-        timeout(Duration::from_secs(6), self.writer.write_all(cmd_line.as_bytes()))
-            .await
-            .map_err(|_| TsProtoError::Timeout)??;
-        timeout(Duration::from_secs(6), self.writer.flush())
-            .await
-            .map_err(|_| TsProtoError::Timeout)??;
+    async fn send_raw(
+        &mut self,
+        cmd_line: &str,
+        pacer: &mut FloodPacer,
+        events_tx: &broadcast::Sender<TsNotifyEvent>,
+    ) -> Result<Vec<RecordMap>> {
+        pacer.wait_slot().await;
 
+        timeout(
+            Duration::from_secs(8),
+            self.writer.write_all(cmd_line.as_bytes()),
+        )
+        .await
+        .map_err(|_| TsProtoError::Timeout)??;
+        timeout(Duration::from_secs(8), self.writer.flush())
+            .await
+            .map_err(|_| TsProtoError::Timeout)??;
+        self.last_io = Instant::now();
+
+        let cmd_trimmed = cmd_line.trim();
         let mut records = Vec::new();
         loop {
-            let line = self.read_line_trimmed(Duration::from_secs(10)).await?;
+            let line = self.read_line_with_timeout(Duration::from_secs(12)).await?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed == cmd_trimmed
+                || trimmed.eq_ignore_ascii_case("TS3")
+                || trimmed.starts_with("Welcome to the ")
+            {
+                // Ignore echoed SSH shell command lines or late greeting banners
                 continue;
             }
             if let Some(status) = parse_error_line(trimmed) {
@@ -281,151 +390,251 @@ impl QueryConnection {
                 });
             }
             if trimmed.starts_with("notify") {
-                // Skip interleaved notify lines on command channel if any occur
+                if let Some(evt) = parse_notify_line(trimmed) {
+                    let _ = events_tx.send(evt);
+                }
                 continue;
             }
             records.extend(parse_records(trimmed));
         }
     }
 
-    async fn ensure_sid(&mut self, sid: u32) -> Result<()> {
-        if self.active_sid == Some(sid) {
-            return Ok(());
-        }
-        let cmd = build_command("use", &[], &[("sid", &sid.to_string())], &[]);
-        match self.send_raw(&cmd).await {
-            Ok(_) => {
-                self.active_sid = Some(sid);
-                Ok(())
+    async fn ensure_sid(
+        &mut self,
+        sid: u32,
+        default_sid: u32,
+        enable_notify: bool,
+        pacer: &mut FloodPacer,
+        events_tx: &broadcast::Sender<TsNotifyEvent>,
+    ) -> Result<()> {
+        if self.active_sid != Some(sid) {
+            let cmd = build_command("use", &[], &[("sid", &sid.to_string())], &[]);
+            match self.send_raw(&cmd, pacer, events_tx).await {
+                Ok(_) => {
+                    self.active_sid = Some(sid);
+                    self.notify_registered = false;
+                }
+                Err(TsProtoError::QueryError { id: 1033, .. }) => {
+                    let vcmd =
+                        build_command("use", &["virtual"], &[("sid", &sid.to_string())], &[]);
+                    self.send_raw(&vcmd, pacer, events_tx).await?;
+                    self.active_sid = Some(sid);
+                    self.notify_registered = false;
+                }
+                Err(e) => return Err(e),
             }
-            Err(TsProtoError::QueryError { id: 1033, .. }) => {
-                // Try -virtual flag if virtual server is currently offline
-                let vcmd = build_command("use", &["virtual"], &[("sid", &sid.to_string())], &[]);
-                self.send_raw(&vcmd).await?;
-                self.active_sid = Some(sid);
-                Ok(())
-            }
-            Err(e) => Err(e),
         }
+
+        if enable_notify && !self.notify_registered && sid == default_sid {
+            for reg_cmd in [
+                "servernotifyregister event=server\n",
+                "servernotifyregister event=channel id=0\n",
+            ] {
+                match self.send_raw(reg_cmd, pacer, events_tx).await {
+                    Ok(_) => {}
+                    Err(TsProtoError::QueryError { id, .. }) if id != 524 && id != 3329 => {
+                        // Restricted Query accounts may lack notify permission; continue without failing
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            self.notify_registered = true;
+        }
+
+        Ok(())
     }
 }
 
+struct DriverCommand {
+    sid: Option<u32>,
+    cmd_line: String,
+    reply_tx: oneshot::Sender<Result<Vec<RecordMap>>>,
+}
+
 pub struct ServerQueryDriver {
-    connector: Arc<dyn QueryStreamConnector>,
-    cmd_conn: Arc<Mutex<Option<QueryConnection>>>,
+    cmd_tx: mpsc::Sender<DriverCommand>,
     events_tx: broadcast::Sender<TsNotifyEvent>,
     shutdown_tx: watch::Sender<bool>,
+    enable_notify: bool,
 }
 
 impl ServerQueryDriver {
-    pub fn new(connector: Arc<dyn QueryStreamConnector>, default_sid: u32, start_notify: bool) -> Self {
+    pub fn new(
+        connector: Arc<dyn QueryStreamConnector>,
+        default_sid: u32,
+        start_notify: bool,
+    ) -> Self {
         let (events_tx, _) = broadcast::channel(256);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let cmd_conn: Arc<Mutex<Option<QueryConnection>>> = Arc::new(Mutex::new(None));
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
 
-        // Keepalive task
         {
-            let cmd_conn = cmd_conn.clone();
-            let mut rx = shutdown_rx.clone();
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(40));
-                ticker.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = rx.changed() => {
-                            if *rx.borrow() { break; }
-                        }
-                        _ = ticker.tick() => {
-                            let mut guard = cmd_conn.lock().await;
-                            if let Some(conn) = guard.as_mut() {
-                                if conn.send_raw("whoami\n").await.is_err() {
-                                    *guard = None;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        // Dedicated NotifySession listener
-        if start_notify {
-            let connector = connector.clone();
             let events_tx = events_tx.clone();
-            let mut rx = shutdown_rx;
             tokio::spawn(async move {
-                let mut backoff = Duration::from_secs(1);
-                loop {
-                    if *rx.borrow() {
-                        break;
-                    }
-                    match Self::run_notify_loop(&*connector, default_sid, &events_tx, &mut rx).await {
-                        Ok(()) => break,
-                        Err(e) => {
-                            warn!("NotifySession disconnected: {e}; reconnecting in {:?}", backoff);
-                            tokio::select! {
-                                _ = rx.changed() => {
-                                    if *rx.borrow() { break; }
-                                }
-                                _ = tokio::time::sleep(backoff) => {}
-                            }
-                            backoff = (backoff * 2).min(Duration::from_secs(15));
-                        }
-                    }
-                }
+                Self::run_session_actor(
+                    connector,
+                    default_sid,
+                    start_notify,
+                    cmd_rx,
+                    events_tx,
+                    shutdown_rx,
+                )
+                .await;
             });
         }
 
         Self {
-            connector,
-            cmd_conn,
+            cmd_tx,
             events_tx,
             shutdown_tx,
+            enable_notify: start_notify,
         }
     }
 
-    async fn run_notify_loop(
-        connector: &dyn QueryStreamConnector,
-        sid: u32,
-        events_tx: &broadcast::Sender<TsNotifyEvent>,
-        shutdown_rx: &mut watch::Receiver<bool>,
-    ) -> Result<()> {
-        let mut conn = QueryConnection::connect(connector).await?;
-        conn.ensure_sid(sid).await?;
-        conn.send_raw("servernotifyregister event=server\n").await?;
-        conn.send_raw("servernotifyregister event=channel id=0\n").await?;
-        conn.send_raw("servernotifyregister event=textserver\n").await?;
-
-        let mut keepalive = tokio::time::interval(Duration::from_secs(45));
-        keepalive.tick().await;
+    async fn run_session_actor(
+        connector: Arc<dyn QueryStreamConnector>,
+        default_sid: u32,
+        enable_notify: bool,
+        mut cmd_rx: mpsc::Receiver<DriverCommand>,
+        events_tx: broadcast::Sender<TsNotifyEvent>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) {
+        let mut conn: Option<QueryConnection> = None;
+        let mut pacer = FloodPacer::new();
+        let mut keepalive_tick = tokio::time::interval(Duration::from_secs(30));
+        keepalive_tick.tick().await;
 
         loop {
             tokio::select! {
+                biased;
+
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
-                        return Ok(());
+                        if let Some(mut c) = conn.take() {
+                            let _ = timeout(Duration::from_secs(2), c.writer.write_all(b"quit\n")).await;
+                            let _ = timeout(Duration::from_secs(1), c.writer.flush()).await;
+                        }
+                        break;
                     }
                 }
-                _ = keepalive.tick() => {
-                    timeout(Duration::from_secs(5), conn.writer.write_all(b"version\n"))
-                        .await
-                        .map_err(|_| TsProtoError::Timeout)??;
-                    timeout(Duration::from_secs(5), conn.writer.flush())
-                        .await
-                        .map_err(|_| TsProtoError::Timeout)??;
+
+                maybe_req = cmd_rx.recv() => {
+                    let Some(req) = maybe_req else {
+                        if let Some(mut c) = conn.take() {
+                            let _ = timeout(Duration::from_secs(2), c.writer.write_all(b"quit\n")).await;
+                        }
+                        break;
+                    };
+                    let res = Self::execute_on_actor(
+                        &mut conn,
+                        &*connector,
+                        default_sid,
+                        enable_notify,
+                        &mut pacer,
+                        &events_tx,
+                        req.sid,
+                        &req.cmd_line,
+                    )
+                    .await;
+                    let _ = req.reply_tx.send(res);
                 }
-                res = conn.read_line_trimmed(Duration::from_secs(90)) => {
-                    let line = res?;
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() || parse_error_line(trimmed).is_some() {
-                        continue;
+
+                idle_res = async {
+                    match conn.as_mut() {
+                        Some(c) => c.read_raw_line().await,
+                        None => std::future::pending().await,
                     }
-                    if let Some(evt) = parse_notify_line(trimmed) {
-                        let _ = events_tx.send(evt);
+                } => {
+                    match idle_res {
+                        Ok(line) => {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                if let Some(evt) = parse_notify_line(trimmed) {
+                                    let _ = events_tx.send(evt);
+                                } else if let Some(status) = parse_error_line(trimmed) {
+                                    if status.id == 524 || status.id == 3329 {
+                                        warn!("TeamSpeak dropped idle session (id={}): {}", status.id, status.msg);
+                                        conn = None;
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Server closed idle connection; drop immediately so next command reconnects cleanly
+                            conn = None;
+                        }
+                    }
+                }
+
+                _ = keepalive_tick.tick() => {
+                    if let Some(c) = conn.as_mut() {
+                        if c.last_io.elapsed() >= Duration::from_secs(110) {
+                            if c.send_raw("whoami\n", &mut pacer, &events_tx).await.is_err() {
+                                conn = None;
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_on_actor(
+        conn_slot: &mut Option<QueryConnection>,
+        connector: &dyn QueryStreamConnector,
+        default_sid: u32,
+        enable_notify: bool,
+        pacer: &mut FloodPacer,
+        events_tx: &broadcast::Sender<TsNotifyEvent>,
+        sid: Option<u32>,
+        cmd_line: &str,
+    ) -> Result<Vec<RecordMap>> {
+        for attempt in 0..2 {
+            let had_existing_conn = conn_slot.is_some();
+            if conn_slot.is_none() {
+                let fresh = QueryConnection::connect(connector, pacer, events_tx).await?;
+                *conn_slot = Some(fresh);
+            }
+
+            let res: Result<Vec<RecordMap>> = async {
+                let conn = conn_slot.as_mut().expect("connected");
+                if let Some(target_sid) = sid {
+                    conn.ensure_sid(target_sid, default_sid, enable_notify, pacer, events_tx)
+                        .await?;
+                }
+                conn.send_raw(cmd_line, pacer, events_tx).await
+            }
+            .await;
+
+            match res {
+                Ok(recs) => return Ok(recs),
+                Err(e) => {
+                    let is_flood = matches!(&e, TsProtoError::QueryError { id: 524, .. });
+                    let is_transport = matches!(
+                        &e,
+                        TsProtoError::Io(_)
+                            | TsProtoError::ConnectionClosed
+                            | TsProtoError::Timeout
+                            | TsProtoError::Ssh(_)
+                    );
+                    if is_transport || is_flood {
+                        *conn_slot = None;
+                    }
+                    if is_flood && attempt == 0 {
+                        tokio::time::sleep(Duration::from_millis(1600)).await;
+                        continue;
+                    }
+                    if is_transport && had_existing_conn && attempt == 0 {
+                        // Existing idle socket was closed by server/NAT; transparently reconnect once
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Err(TsProtoError::ConnectionClosed)
     }
 
     async fn exec(
@@ -435,39 +644,21 @@ impl ServerQueryDriver {
         options: &[&str],
         params: &[(&str, &str)],
     ) -> Result<Vec<RecordMap>> {
-        let cmd_str = build_command(cmd, options, params, &[]);
-        let mut guard = self.cmd_conn.lock().await;
+        let cmd_line = build_command(cmd, options, params, &[]);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(DriverCommand {
+                sid,
+                cmd_line,
+                reply_tx,
+            })
+            .await
+            .map_err(|_| TsProtoError::ConnectionClosed)?;
 
-        for attempt in 0..2 {
-            if guard.is_none() {
-                *guard = Some(QueryConnection::connect(&*self.connector).await?);
-            }
-            let conn = guard.as_mut().expect("just connected");
-            if let Some(target_sid) = sid {
-                if let Err(e) = conn.ensure_sid(target_sid).await {
-                    if attempt == 0 && matches!(e, TsProtoError::Io(_) | TsProtoError::ConnectionClosed | TsProtoError::Timeout) {
-                        *guard = None;
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-            match conn.send_raw(&cmd_str).await {
-                Ok(recs) => return Ok(recs),
-                Err(e) => {
-                    let transient = matches!(
-                        e,
-                        TsProtoError::Io(_) | TsProtoError::ConnectionClosed | TsProtoError::Timeout
-                    );
-                    if transient && attempt == 0 {
-                        *guard = None;
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        Err(TsProtoError::ConnectionClosed)
+        timeout(Duration::from_secs(25), reply_rx)
+            .await
+            .map_err(|_| TsProtoError::Timeout)?
+            .map_err(|_| TsProtoError::ConnectionClosed)?
     }
 }
 
@@ -478,7 +669,7 @@ fn flag_str(b: bool) -> &'static str {
 #[async_trait]
 impl TsProtocolDriver for ServerQueryDriver {
     fn supports_push_events(&self) -> bool {
-        true
+        self.enable_notify
     }
 
     fn subscribe_events(&self) -> broadcast::Receiver<TsNotifyEvent> {
@@ -1163,10 +1354,6 @@ impl TsProtocolDriver for ServerQueryDriver {
 
     async fn shutdown(&self) -> Result<()> {
         let _ = self.shutdown_tx.send(true);
-        let mut guard = self.cmd_conn.lock().await;
-        if let Some(mut conn) = guard.take() {
-            let _ = conn.writer.write_all(b"quit\n").await;
-        }
         Ok(())
     }
 }

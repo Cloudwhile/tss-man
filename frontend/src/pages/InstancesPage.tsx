@@ -132,6 +132,7 @@ export function InstancesPage() {
   const handleCreateInstance = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setNotice(null);
     try {
       const created = await apiRequest<InstanceView>('/instances', {
         method: 'POST',
@@ -153,7 +154,11 @@ export function InstancesPage() {
       setSecret('');
       await refreshInstances();
       setActiveInstanceId(created.id);
-      setNotice(`${created.name} connected`);
+      if (created.status === 'offline' && created.last_error) {
+        setError(created.last_error);
+      } else {
+        setNotice(`${created.name} connected`);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Create instance failed');
     }
@@ -177,6 +182,7 @@ export function InstancesPage() {
   const handleSaveVs = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeInstanceId || editVsId === null) return;
+    setError(null);
     try {
       await apiRequest(`/instances/${activeInstanceId}/servers/${editVsId}/info`, {
         method: 'PUT',
@@ -320,11 +326,23 @@ export function InstancesPage() {
                           size="xs"
                           variant="tertiary"
                           onClick={async () => {
-                            await apiRequest(`/instances/${inst.id}/reconnect`, {
-                              method: 'POST',
-                            });
-                            await refreshInstances();
-                            await loadVirtualServers();
+                            setError(null);
+                            setNotice(null);
+                            try {
+                              const updated = await apiRequest<InstanceView>(
+                                `/instances/${inst.id}/reconnect`,
+                                { method: 'POST' },
+                              );
+                              await refreshInstances();
+                              await loadVirtualServers();
+                              if (updated.status === 'offline' && updated.last_error) {
+                                setError(updated.last_error);
+                              } else {
+                                setNotice(`${updated.name} connected`);
+                              }
+                            } catch (err) {
+                              setError(err instanceof Error ? err.message : 'Reconnect failed');
+                            }
                           }}
                         >
                           <RefreshCw className="w-3.5 h-3.5" aria-hidden="true" />

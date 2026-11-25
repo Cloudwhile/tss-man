@@ -12,8 +12,8 @@ use chrono::{Duration, Utc};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use serde::{Deserialize, Serialize};
 use tss_tsproto::{
-    create_driver, EditServerInfoParams, ProtocolKind, ServerInfoSnapshot, TsConnectionConfig,
-    VirtualServerSummary,
+    create_ephemeral_driver, EditServerInfoParams, ProtocolKind, ServerInfoSnapshot,
+    TsConnectionConfig, TsProtoError, VirtualServerSummary,
 };
 use uuid::Uuid;
 
@@ -265,15 +265,19 @@ async fn test_connection(
         virtual_server_id: req.virtual_server_id.max(1),
         tls_verify: req.tls_verify,
     };
-    let drv = create_driver(&cfg)?;
-    let res = drv.test_connection().await;
-    let servers = if res.is_ok() {
-        drv.list_virtual_servers().await.unwrap_or_default()
-    } else {
-        Vec::new()
+    let drv = create_ephemeral_driver(&cfg)?;
+    let servers = match drv.list_virtual_servers().await {
+        Ok(list) => list,
+        Err(TsProtoError::QueryError { id: 2568, .. }) => {
+            drv.test_connection().await?;
+            Vec::new()
+        }
+        Err(e) => {
+            let _ = drv.shutdown().await;
+            return Err(e.into());
+        }
     };
     let _ = drv.shutdown().await;
-    res?;
     Ok(Json(serde_json::json!({
         "ok": true,
         "virtual_servers": servers
@@ -539,7 +543,44 @@ async fn edit_server_info(
     auth.require_instance_role(&state.db, &id, InstanceRole::ServerAdmin)
         .await?;
     let drv = state.hub.driver_for(&id).await?;
-    drv.edit_server_info(sid, &req).await?;
+
+    // Only transmit modified fields so unchanged properties (such as max_clients on
+    // slot-locked servers) do not trigger unnecessary permission checks.
+    let current = match state.hub.get_live_state(&id, sid).await.and_then(|l| l.server_info) {
+        Some(info) => Some(info),
+        None => drv.get_server_info(sid).await.ok(),
+    };
+    let diff = if let Some(cur) = current {
+        EditServerInfoParams {
+            name: req.name.clone().filter(|v| v != &cur.name),
+            welcome_message: req
+                .welcome_message
+                .clone()
+                .filter(|v| v != &cur.welcome_message),
+            max_clients: req.max_clients.filter(|&v| v != cur.max_clients),
+            password: req.password.clone().filter(|v| !v.is_empty()),
+            hostbanner_url: req
+                .hostbanner_url
+                .clone()
+                .filter(|v| v != &cur.hostbanner_url),
+            hostbanner_gfx_url: req
+                .hostbanner_gfx_url
+                .clone()
+                .filter(|v| v != &cur.hostbanner_gfx_url),
+            hostbutton_tooltip: req
+                .hostbutton_tooltip
+                .clone()
+                .filter(|v| v != &cur.hostbutton_tooltip),
+            hostbutton_url: req
+                .hostbutton_url
+                .clone()
+                .filter(|v| v != &cur.hostbutton_url),
+        }
+    } else {
+        req.clone()
+    };
+
+    drv.edit_server_info(sid, &diff).await?;
     let _ = state.hub.refresh_virtual_server(&id, sid, false).await;
     write_audit_log(
         &state.db,
@@ -549,7 +590,7 @@ async fn edit_server_info(
         Some(sid as i32),
         "virtual_server.edit",
         &format!("sid:{sid}"),
-        serde_json::to_value(&req).unwrap_or_default(),
+        serde_json::to_value(&diff).unwrap_or_default(),
         &auth.ip_addr,
     )
     .await;
