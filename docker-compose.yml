@@ -1,0 +1,42 @@
+services:
+  tss-manager:
+    image: ghcr.io/cloudwhile/tss-man:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tss-manager
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - tss_data:/app/data
+    environment:
+      TSS_LISTEN_ADDR: "0.0.0.0:3000"
+      TSS_DATA_DIR: "/app/data"
+      RUST_LOG: "info,tss_server=info,tss_tsproto=info"
+      # Default zero-config SQLite WAL mode:
+      DATABASE_URL: "sqlite:///app/data/tss-manager.db?mode=rwc"
+      # Switch to PostgreSQL by uncommenting below and running with `--profile postgres`:
+      # DATABASE_URL: "postgres://tss:tss_secret@postgres:5432/tss_manager"
+      # Optional fixed 32-byte master key (64 hex chars or 44 base64 chars):
+      # TSS_MASTER_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+  postgres:
+    image: postgres:17-alpine
+    profiles: ["postgres"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tss
+      POSTGRES_PASSWORD: tss_secret
+      POSTGRES_DB: tss_manager
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tss -d tss_manager"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  tss_data:
+  pg_data:
