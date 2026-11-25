@@ -90,6 +90,30 @@ impl AppError {
     }
 }
 
+impl std::fmt::Display for AppError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppError::Validation(m) => write!(f, "Validation error: {m}"),
+            AppError::Unauthorized(m) => write!(f, "Unauthorized: {m}"),
+            AppError::Forbidden(m) => write!(f, "Forbidden: {m}"),
+            AppError::NotFound(m) => write!(f, "Not found: {m}"),
+            AppError::Conflict(m) => write!(f, "Conflict: {m}"),
+            AppError::RateLimited(m) => write!(f, "Rate limited: {m}"),
+            AppError::UpstreamTs {
+                ts_error_id: Some(id),
+                detail,
+            } => write!(f, "TeamSpeak upstream error (id={id}): {detail}"),
+            AppError::UpstreamTs {
+                ts_error_id: None,
+                detail,
+            } => write!(f, "TeamSpeak upstream error: {detail}"),
+            AppError::Internal(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for AppError {}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, problem_type, title, code) = self.status_and_meta();

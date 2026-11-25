@@ -23,35 +23,117 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tss_migration::Migrator;
 
+pub fn normalize_database_url(database_url: &str) -> String {
+    let trimmed = database_url.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    let with_scheme = if !trimmed.contains("://") && !trimmed.starts_with("sqlite:") {
+        format!("sqlite://{}", trimmed.replace('\\', "/"))
+    } else {
+        trimmed.to_string()
+    };
+
+    if let Some(rest) = with_scheme
+        .strip_prefix("sqlite://")
+        .or_else(|| with_scheme.strip_prefix("sqlite:"))
+    {
+        let (path_part, query_part) = match rest.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (rest, None),
+        };
+        if path_part != ":memory:" && !path_part.is_empty() {
+            let has_mode = query_part
+                .map(|q| q.split('&').any(|kv| kv.starts_with("mode=")))
+                .unwrap_or(false);
+            if !has_mode {
+                return match query_part {
+                    Some(q) if !q.is_empty() => format!("{with_scheme}&mode=rwc"),
+                    Some(_) => format!("{with_scheme}mode=rwc"),
+                    None => format!("{with_scheme}?mode=rwc"),
+                };
+            }
+        }
+    }
+    with_scheme
+}
+
 pub async fn init_database(database_url: &str) -> ApiResult<DatabaseConnection> {
-    if let Some(rest) = database_url.strip_prefix("sqlite://") {
+    let normalized_url = normalize_database_url(database_url);
+
+    if let Some(rest) = normalized_url
+        .strip_prefix("sqlite://")
+        .or_else(|| normalized_url.strip_prefix("sqlite:"))
+    {
         let path_part = rest.split('?').next().unwrap_or("");
         if !path_part.is_empty() && path_part != ":memory:" {
             if let Some(parent) = Path::new(path_part).parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent).map_err(|e| {
-                        AppError::Internal(format!("Failed to create SQLite dir: {e}"))
+                        AppError::Internal(format!(
+                            "Failed to create SQLite directory '{}': {e}",
+                            parent.display()
+                        ))
                     })?;
                 }
             }
         }
     }
 
-    let mut opt = ConnectOptions::new(database_url.to_string());
-    opt.max_connections(16)
-        .min_connections(1)
-        .sqlx_logging(false);
+    let is_postgres = normalized_url.starts_with("postgres://")
+        || normalized_url.starts_with("postgresql://");
+    let max_attempts = if is_postgres { 10 } else { 1 };
+    let mut last_err = None;
+    let mut connected_db = None;
 
-    let db = Database::connect(opt)
-        .await
-        .map_err(|e| AppError::Internal(format!("Database connect failed: {e}")))?;
+    for attempt in 1..=max_attempts {
+        let mut opt = ConnectOptions::new(normalized_url.clone());
+        opt.max_connections(if is_postgres { 16 } else { 1 })
+            .min_connections(1)
+            .sqlx_logging(false);
+
+        match Database::connect(opt).await {
+            Ok(conn) => {
+                connected_db = Some(conn);
+                break;
+            }
+            Err(e) => {
+                if attempt < max_attempts {
+                    tracing::warn!(
+                        "Database connection attempt {attempt}/{max_attempts} failed ({e}); retrying in 1500ms..."
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+
+    let db = match connected_db {
+        Some(conn) => conn,
+        None => {
+            let detail = last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown connection error".to_string());
+            return Err(AppError::Internal(format!(
+                "Database connect failed: {detail}"
+            )));
+        }
+    };
 
     if db.get_database_backend() == DbBackend::Sqlite {
-        db.execute_unprepared(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;",
-        )
-        .await
-        .map_err(|e| AppError::Internal(format!("SQLite pragma failed: {e}")))?;
+        db.execute_unprepared("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")
+            .await
+            .map_err(|e| AppError::Internal(format!("SQLite pragma failed: {e}")))?;
+
+        if let Err(e) = db
+            .execute_unprepared("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+            .await
+        {
+            tracing::warn!(
+                "SQLite WAL mode unavailable on this volume ({e}); continuing with default journal mode"
+            );
+        }
     }
 
     Migrator::up(&db, None)
@@ -352,5 +434,37 @@ mod tests {
         // Moderator CANNOT access /users (requires super_admin)
         let (st, _, _) = send_json(&app, "GET", "/api/v1/users", Some(&mod_token), None).await;
         assert_eq!(st, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn sqlite_url_normalization_and_init_without_mode_param() {
+        assert_eq!(
+            normalize_database_url("sqlite:///app/data/tss.db"),
+            "sqlite:///app/data/tss.db?mode=rwc"
+        );
+        assert_eq!(
+            normalize_database_url("sqlite:/app/data/tss.db?cache=shared"),
+            "sqlite:/app/data/tss.db?cache=shared&mode=rwc"
+        );
+        assert_eq!(
+            normalize_database_url("sqlite:///app/data/tss.db?mode=rw"),
+            "sqlite:///app/data/tss.db?mode=rw"
+        );
+        assert_eq!(
+            normalize_database_url("postgres://user:pass@localhost:5432/tss"),
+            "postgres://user:pass@localhost:5432/tss"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let nested_db = tmp.path().join("nested").join("auto_create.db");
+        let raw_url = format!(
+            "sqlite://{}",
+            nested_db.to_string_lossy().replace('\\', "/")
+        );
+        let db = init_database(&raw_url)
+            .await
+            .expect("SQLite URL without ?mode=rwc should auto-create directory and file");
+        assert!(nested_db.exists());
+        drop(db);
     }
 }

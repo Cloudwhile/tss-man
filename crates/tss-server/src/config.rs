@@ -8,19 +8,26 @@ pub struct ServerConfig {
     pub master_key_env: Option<String>,
 }
 
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 impl ServerConfig {
     pub fn from_env() -> Self {
         let data_dir = PathBuf::from(
-            std::env::var("TSS_DATA_DIR").unwrap_or_else(|_| "./data".to_string()),
+            non_empty_env("TSS_DATA_DIR").unwrap_or_else(|| "./data".to_string()),
         );
         let default_db = format!(
             "sqlite://{}/tss-manager.db?mode=rwc",
             data_dir.to_string_lossy().replace('\\', "/")
         );
-        let database_url = std::env::var("DATABASE_URL").unwrap_or(default_db);
+        let database_url = non_empty_env("DATABASE_URL").unwrap_or(default_db);
         let listen_addr =
-            std::env::var("TSS_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
-        let master_key_env = std::env::var("TSS_MASTER_KEY").ok();
+            non_empty_env("TSS_LISTEN_ADDR").unwrap_or_else(|| "0.0.0.0:3000".to_string());
+        let master_key_env = non_empty_env("TSS_MASTER_KEY");
 
         Self {
             listen_addr,

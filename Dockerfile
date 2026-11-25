@@ -30,17 +30,42 @@ LABEL org.opencontainers.image.title="TSS Manager" \
       org.opencontainers.image.licenses="MIT"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl3 curl \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 curl gosu \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 tss \
     && useradd --uid 10001 --gid tss --create-home --shell /usr/sbin/nologin tss \
     && mkdir -p /app/data \
-    && chown -R tss:tss /app
+    && chown -R tss:tss /app \
+    && printf '%s\n' \
+       '#!/bin/sh' \
+       'set -e' \
+       'DATA_DIR="${TSS_DATA_DIR:-/app/data}"' \
+       'if [ "$(id -u)" = "0" ]; then' \
+       '  mkdir -p "$DATA_DIR"' \
+       '  chown -R "${PUID:-10001}:${PGID:-10001}" "$DATA_DIR" 2>/dev/null || true' \
+       '  DB_DIR=""' \
+       '  case "${DATABASE_URL:-}" in' \
+       '    sqlite://*)' \
+       '      DB_PATH="${DATABASE_URL#sqlite://}"' \
+       '      DB_PATH="${DB_PATH%%\?*}"' \
+       '      if [ -n "$DB_PATH" ] && [ "$DB_PATH" != ":memory:" ]; then' \
+       '        DB_DIR="$(dirname "$DB_PATH")"' \
+       '        mkdir -p "$DB_DIR"' \
+       '        chown -R "${PUID:-10001}:${PGID:-10001}" "$DB_DIR" 2>/dev/null || true' \
+       '      fi' \
+       '      ;;' \
+       '  esac' \
+       '  if gosu "${PUID:-10001}:${PGID:-10001}" test -w "$DATA_DIR" && { [ -z "$DB_DIR" ] || gosu "${PUID:-10001}:${PGID:-10001}" test -w "$DB_DIR"; }; then' \
+       '    exec gosu "${PUID:-10001}:${PGID:-10001}" "$@"' \
+       '  fi' \
+       'fi' \
+       'exec "$@"' \
+       > /usr/local/bin/docker-entrypoint.sh \
+    && chmod +x /usr/local/bin/docker-entrypoint.sh
 
 WORKDIR /app
 COPY --from=rust-builder /app/target/release/tss-server /usr/local/bin/tss-server
 
-USER tss:tss
 VOLUME ["/app/data"]
 ENV TSS_LISTEN_ADDR="0.0.0.0:3000" \
     TSS_DATA_DIR="/app/data" \
@@ -50,4 +75,5 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD curl -fsS http://127.0.0.1:3000/api/v1/setup/status >/dev/null || exit 1
 
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["tss-server"]

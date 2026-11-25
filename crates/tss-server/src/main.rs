@@ -18,17 +18,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = ServerConfig::from_env();
     info!("Starting TSS Manager on http://{}", cfg.listen_addr);
 
-    let db = init_database(&cfg.database_url)
-        .await
-        .map_err(|e| format!("DB init error: {:?}", e.status_and_meta()))?;
+    let db = init_database(&cfg.database_url).await.map_err(|e| {
+        tracing::error!("Database initialization failed: {e}");
+        format!("DB init error: {e}")
+    })?;
     let crypto = Arc::new(
-        CryptoContext::load_or_create(&cfg.data_dir, cfg.master_key_env.as_deref())
-            .map_err(|e| format!("Crypto init error: {:?}", e.status_and_meta()))?,
+        CryptoContext::load_or_create(&cfg.data_dir, cfg.master_key_env.as_deref()).map_err(
+            |e| {
+                tracing::error!("Crypto initialization failed: {e}");
+                format!("Crypto init error: {e}")
+            },
+        )?,
     );
 
-    let state = create_app_state(db, crypto)
-        .await
-        .map_err(|e| format!("App state error: {:?}", e.status_and_meta()))?;
+    let state = create_app_state(db, crypto).await.map_err(|e| {
+        tracing::error!("Application state initialization failed: {e}");
+        format!("App state error: {e}")
+    })?;
 
     scheduler::start_scheduler(state.clone());
     let app = build_router(state);
