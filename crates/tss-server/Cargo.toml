@@ -1,0 +1,42 @@
+[package]
+name = "tss-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tss-tsproto = { path = "../tss-tsproto" }
+tss-migration = { path = "../tss-migration" }
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+sea-orm.workspace = true
+sea-orm-migration.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+argon2.workspace = true
+chacha20poly1305.workspace = true
+jsonwebtoken.workspace = true
+totp-rs.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
+rand.workspace = true
+cron.workspace = true
+reqwest.workspace = true
+rust-embed.workspace = true
+mime_guess.workspace = true
+dotenvy.workspace = true
+
+[dev-dependencies]
+tss-tsproto = { path = "../tss-tsproto", features = ["test-mock"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3.15"
